@@ -676,6 +676,38 @@ class NativeStreamRestorer:
         self.finish_reason: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
         self.got_any = False
+        self.delivered_chars = 0      # 已交付给客户端的正文字数
+        self.lenient_closures = 0     # 主动收口次数（上游没给分片结束标记时）
+        self.recent: List[Dict[str, Any]] = []   # 最近几个分片的**形状**（不含正文）
+
+    # ---- 诊断信息（只含元数据，不含正文） ----
+
+    def _note_part(self, fc: Dict[str, Any]) -> None:
+        """记下分片形状，用来核对 Google 实际给的字段与 willContinue 语义。
+
+        只记键名、willContinue 和片段长度——**不记 stringValue**，避免把正文带进日志。
+        """
+        partials = fc.get("partialArgs")
+        shape: Dict[str, Any] = {
+            "keys": sorted(fc.keys()),
+            "willContinue": fc.get("willContinue"),
+            "args": "object" if isinstance(fc.get("args"), dict) else None,
+            "partial": None if not isinstance(partials, list) else [
+                {"jsonPath": p.get("jsonPath"), "willContinue": p.get("willContinue"),
+                 "len": len(p.get("stringValue") or "")}
+                for p in partials[:8] if isinstance(p, dict)
+            ],
+        }
+        self.recent.append(shape)
+        del self.recent[:-3]
+
+    def shape_summary(self) -> str:
+        return json.dumps(self.recent, ensure_ascii=False) if self.recent else "(无分片)"
+
+    def progress(self) -> str:
+        return (f"started={self.started} str={self.string_started}/{self.string_closed} "
+                f"call={self.call_closed} full_args={self.full_args} "
+                f"已交付={self.delivered_chars}字 收口={self.lenient_closures}次")
 
     # ---- 正文交付（预填充去重统一在这一处） ----
 
@@ -687,6 +719,7 @@ class NativeStreamRestorer:
             if not text:
                 return ""
         self.got_any = True
+        self.delivered_chars += len(text)
         return self.writer.chunk({"content": text})
 
     def flush_deduper(self) -> str:
@@ -701,6 +734,7 @@ class NativeStreamRestorer:
 
     def _call(self, fc: Dict[str, Any]) -> List[str]:
         out: List[str] = []
+        self._note_part(fc)
         name = fc.get("name")
         if self.call_closed or (name is not None and name != self.tool_name):
             raise _StreamFail("unexpected_call")
@@ -746,11 +780,38 @@ class NativeStreamRestorer:
 
         if fc.get("willContinue") is not True:
             if not self.string_closed:
-                raise _StreamFail("incomplete_args")
+                self._close_string_leniently("functionCall 声明的参数结束")
             if not self.full_args:
                 self.decoder.feed("}")
             self.call_closed = True
         return out
+
+    def _close_string_leniently(self, why: str) -> None:
+        """上游声明"参数结束"、却没给分片级结束标记时，主动把 content 字符串收口。
+
+        背景（2026-10 用 gemini-4-argon 实测）：``partialArgs[].willContinue`` 在
+        最后一个分片上**仍可能是 true**，参数是否结束只体现在 ``functionCall.willContinue``
+        或 ``finishReason`` 上。上游 Node 项目按 gemini-3.x 的语义写死了"最后一片必须
+        带 willContinue=false"，于是把一次**正文已经完整交付**的回复错判成
+        ``incomplete_args``——客户端看到的是"内容全对，最后弹一个失败"。
+
+        为什么主动收口是安全的：
+          1. 本方法只在**传输已经确认结束**的上下文里被调用——HTTP 流正常读完并收到了
+             结束原因或 functionCall 结束标记。TCP 不会静默跳过中间字节：要么数据完整
+             到达，要么连接报错（那条路径会被 stream_chat 标成 finish_reason=length）；
+          2. 收口之后 decoder 仍要过完整结构校验（见 _finish），真正被截断、转义残缺的
+             流依然会判失败。
+
+        分片一个都没收到时不收口：那是真的异常，不能让空回复假装成功。
+        """
+        if not (self.string_started and not self.full_args):
+            raise _StreamFail("incomplete_args")
+        self.decoder.feed('"')
+        self.string_closed = True
+        self.lenient_closures += 1
+        _log(f"⚠️ 上游未给分片结束标记（{why}），已主动收口：正文已交付 "
+             f"{self.delivered_chars} 字，收口后仍会做结构校验。"
+             f"分片形状：{self.shape_summary()}")
 
     def _claim_synthetic(self, text: str, out: List[str]) -> None:
         if not text:
@@ -772,13 +833,22 @@ class NativeStreamRestorer:
         if self.terminal:
             self.failed = True
             raise _StreamFail("duplicate_finish")
-        if reason == "STOP" and self.started and not self.call_closed:
-            self.failed = True
-            raise _StreamFail("incomplete_args")
         mapped = NATIVE_TO_OPENAI_FINISH.get("SAFETY" if block else (reason or ""), "stop")
+        if self.started and not self.call_closed and mapped not in CUT_SHORT_REASONS:
+            # 正文早已逐片交付，只是上游没给收口标记（见 _close_string_leniently）：
+            # 主动收口后交给下面的结构校验裁决，而不是直接判失败。
+            self._close_string_leniently(f"finishReason={reason}")
+            if not self.full_args:
+                self.decoder.feed("}")
+            self.call_closed = True
         if self.decoder.found and not self.decoder.valid and mapped not in CUT_SHORT_REASONS:
             self.failed = True
             raise _StreamFail("incomplete_arguments")
+        if mapped == "tool_calls" and self.restored and not self.failed:
+            # 唯一的工具调用就是合成通道，而且正文已经还原出来了：对客户端而言这是一次
+            # 正常文本回复。若照搬上游结束原因，客户端会看到 finish_reason=tool_calls
+            # 却没有任何 tool_calls，容易触发它自己的工具分支。
+            mapped = "stop"
         self.terminal = True
         self.finish_reason = mapped
         return [self.writer.chunk({}, finish_reason=mapped, native_reason=reason)]
@@ -927,8 +997,11 @@ async def stream_chat(*, api_key: str, model_path: str, body: Dict[str, Any],
                 yield piece
             break
         except _StreamFail as exc:
-            _log(f"❌ 协议异常 {exc.code}，已停止本轮（不再重发，避免正文重复）。")
-            yield writer.error(exc.code, f"抗截断传输失败（{exc.code}）。")
+            _log(f"❌ 协议异常 {exc.code}，已停止本轮（不再重发，避免正文重复）。"
+                 f"状态：{restorer.progress()}；最近分片形状：{restorer.shape_summary()}")
+            yield writer.error(exc.code,
+                               f"抗截断传输失败（{exc.code}）；已交付 "
+                               f"{restorer.delivered_chars} 字。")
             yield "data: [DONE]\n\n"
             return
         except _UpstreamHTTP as exc:
