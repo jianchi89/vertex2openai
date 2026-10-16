@@ -774,7 +774,12 @@ class NativeStreamRestorer:
                 if self.decoder.invalid:
                     raise _StreamFail("invalid_partial_args")
                 self._claim_synthetic(text, out)
-            if part.get("willContinue") is not True:
+            # 只有**显式**的 willContinue=false 才算"这个字符串写完了"。
+            # 缺失/None 一律不下结论（proto3 里省略字段等价于 false，但真实流量里
+            # Google 会在末尾补一个空片段把它置空——照 proto 语义收口会过早，
+            # 之后的片段就会被判成 invalid_partial_args）。留到 functionCall 结束
+            # 或 finishReason 那一步统一收口，见 _close_string_leniently。
+            if part.get("willContinue") is False:
                 self.decoder.feed('"')
                 self.string_closed = True
 
@@ -803,7 +808,11 @@ class NativeStreamRestorer:
              流依然会判失败。
 
         分片一个都没收到时不收口：那是真的异常，不能让空回复假装成功。
+        已经收口过一次就直接返回：重复往 JSON 状态机里喂收口符会把结构弄坏
+        （实测就是这么把一次完整回复判成 incomplete_arguments 的）。
         """
+        if self.string_closed:
+            return
         if not (self.string_started and not self.full_args):
             raise _StreamFail("incomplete_args")
         self.decoder.feed('"')
@@ -837,7 +846,9 @@ class NativeStreamRestorer:
         if self.started and not self.call_closed and mapped not in CUT_SHORT_REASONS:
             # 正文早已逐片交付，只是上游没给收口标记（见 _close_string_leniently）：
             # 主动收口后交给下面的结构校验裁决，而不是直接判失败。
-            self._close_string_leniently(f"finishReason={reason}")
+            # 注意必须判 string_closed：分片层可能已经收过口，这里只差最外层的 "}"。
+            if not self.string_closed:
+                self._close_string_leniently(f"finishReason={reason}")
             if not self.full_args:
                 self.decoder.feed("}")
             self.call_closed = True
