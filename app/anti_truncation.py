@@ -51,6 +51,7 @@ from logger import stats
 from message_processing import PrefillDeduper
 from models import OpenAIRequest
 from runtime_state import app_state
+import model_capabilities as mc
 
 # ---------------------------------------------------------------- 常量
 
@@ -169,6 +170,66 @@ def build_instruction(tool_name: str, continuation: bool = False) -> str:
 
 def new_tool_name() -> str:
     return TOOL_PREFIX + secrets.token_hex(12)
+
+
+# ---------------------------------------------------------------- 模型列表变体
+# 很多客户端（酒馆手机版、TauriTavern 等）的模型是**下拉选择**、不能手输模型名，
+# 所以抗截断不能只靠"自己在模型名后面加后缀"。这里把变体直接并进 /v1/models，
+# 客户端刷新模型列表后就能直接选。
+
+#: 暴露给客户端的抗截断版本后缀
+VARIANT_SUFFIX = "-抗截断"
+#: 默认给哪些模型生成抗截断版本（改 config.DEFAULT_SETTINGS["anti_truncation_models"] 即可）
+DEFAULT_VARIANT_MODELS = ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash"]
+
+
+def variant_eligible(base_id: str) -> bool:
+    """该模型是否适合生成抗截断版本。
+
+    必须与 skip_reason 的准入规则保持一致，否则下拉里会出现"选了却静默回落普通通道"
+    的选项：生图/向量模型排除；``-search`` 变体排除（联网搜索请求本来就会跳过抗截断）。
+
+    生图判定一律走能力档案，**不能只靠名字**：``gemini-nano-banana-2.1`` 名字里既没有
+    image 也没有 embedding（见 model_capabilities.get_profile 的注释），用名字匹配会漏判，
+    结果就是在列表里给生图模型挂上一个永远不会生效的抗截断版本。
+    """
+    name = (base_id or "").strip()
+    if not name or name.endswith("-search"):
+        return False
+    if not re.match(r"^gemini-[\w.\-]+$", name):
+        return False
+    try:
+        if mc.get_profile(name).get("is_image"):
+            return False
+    except Exception:
+        pass
+    if re.search(r"image|embedding|nano-banana", name, re.I):
+        return False
+    return True
+
+
+def variant_base_models(available: List[str]) -> List[str]:
+    """要生成抗截断版本的基础模型名（结果一定在 available 里，避免下拉出现上游没有的模型）。
+
+    设置 ``anti_truncation_models`` 的语义：
+      - ``["*"]``            → 所有可用的文本 Gemini 模型
+      - ``["a", "b"]``       → 指定模型（与可用列表求交集）
+      - ``[]``               → 不生成任何抗截断版本
+      - 缺省 / 非法值         → 用 DEFAULT_VARIANT_MODELS
+    """
+    avail = [str(m).strip() for m in (available or []) if variant_eligible(str(m))]
+    try:
+        configured = app_state.get_setting("anti_truncation_models", DEFAULT_VARIANT_MODELS)
+    except Exception:
+        configured = DEFAULT_VARIANT_MODELS
+    if not isinstance(configured, (list, tuple)):
+        configured = DEFAULT_VARIANT_MODELS
+    wanted = [str(m).strip() for m in configured if str(m).strip()]
+    if not wanted:
+        return []
+    if any(w == "*" or w.lower() == "all" for w in wanted):
+        return avail
+    return [m for m in avail if m in set(wanted)]
 
 
 # ---------------------------------------------------------------- 增量 JSON 解码器
