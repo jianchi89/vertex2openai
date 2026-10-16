@@ -1,0 +1,190 @@
+--- a/app/config.py
++++ b/app/config.py
+@@ -77,12 +77,16 @@
+     # 语义：retry_max = 失败后的**重试**次数，总请求次数 = retry_max + 1。
+     # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
+     "retry_max": 10,
+-    "retry_backoff_seconds": 5,
++    "retry_backoff_seconds": 3.5,
+     # 开关（初始值取环境变量）
+     "fake_streaming": FAKE_STREAMING_ENABLED,
+     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
+     "roundrobin": ROUNDROBIN,
+     "safety_score": SAFETY_SCORE,
++    # 抗截断传输（synthetic tool transport，把正文改道进合成函数参数再增量还原）。
++    # 默认关；也可以用模型名后缀按次启用（-抗截断 / -antitrunc），后者不依赖落盘状态，
++    # Render 免费层冷启动也不会丢。见 anti_truncation.py 头部说明。
++    "anti_truncation": False,
+     # 预填充兼容模式: smart|minimal|off
+     # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用某真实酒馆预设
+     # （预填充为一段完整句子 + 一个未闭合的思维链开标签）实测 gemini-3.6-flash × 3：
+--- a/app/api_helpers.py
++++ b/app/api_helpers.py
+@@ -1012,6 +1012,9 @@
+                             yield f"data: {json.dumps(_pf)}\n\n"
+ 
+                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
++                        # 是否见过上游给出的结束原因：没有就说明这一轮是在没有正常收尾的
++                        # 情况下断掉的（连接被掐、上游静默中断），必须显式标记为截断。
++                        _saw_finish = False
+ 
+                         async for chunk_item_call in stream_gen_obj:
+                             if getattr(chunk_item_call, "usage_metadata", None):
+@@ -1021,6 +1024,10 @@
+                             num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
+                             for ci in range(num_candidates):
+                                 has_yielded = True
++                                _cand = (chunk_item_call.candidates[ci]
++                                         if getattr(chunk_item_call, "candidates", None) else None)
++                                if getattr(_cand, "finish_reason", None):
++                                    _saw_finish = True
+                                 sse_chunk = convert_chunk_to_openai(
+                                     chunk_item_call, request_obj.model, response_id_for_stream, ci,
+                                     indexer=tool_indexer)
+@@ -1040,6 +1047,18 @@
+                         if final_p_tk > 0 or final_c_tk > 0:
+                             stats.add_tokens(final_p_tk, final_c_tk)
+                             print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
++
++                        # 上游迭代器正常结束、却自始至终没给过结束原因：这一轮是被掐断的，
++                        # 必须显式标记 finish_reason=length，否则客户端会把半截回复当正常结束。
++                        if not _saw_finish:
++                            print("⚠️ [上游截断] 上游流未给出结束原因就结束了（连接可能被中途掐断）；"
++                                  "已按截断标记 finish_reason=length。")
++                            _cut_end = {"id": response_id_for_stream,
++                                        "object": "chat.completion.chunk",
++                                        "created": int(time.time()), "model": request_obj.model,
++                                        "choices": [{"index": 0, "delta": {},
++                                                     "finish_reason": "length"}]}
++                            yield f"data: {json.dumps(_cut_end, ensure_ascii=False)}\n\n"
+ 
+                         # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
+                         if wants_usage(request_obj):
+@@ -1101,8 +1120,16 @@
+                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
+                         if is_auto_attempt:
+                             raise e_stream_call
+-                        # 已经输出过内容：不再重发错误体，只补结束标记，避免污染已有输出
++                        # 已经输出过内容：不再重发错误体（避免污染已有输出），但**必须**
++                        # 明确标记这是被截断的一轮。旧行为只补一个 [DONE]，客户端会把
++                        # "后半段丢失"当成正常结束——这正是静默截断的成因。
+                         if has_yielded:
++                            print("⚠️ [上游截断] 正文已输出过半，上游中断；已按截断标记 "
++                                  "finish_reason=length（不再重发，避免正文重复）。")
++                            _cut = {"id": response_id_for_stream, "object": "chat.completion.chunk",
++                                    "created": int(time.time()), "model": request_obj.model,
++                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
++                            yield f"data: {json.dumps(_cut, ensure_ascii=False)}\n\n"
+                             yield "data: [DONE]\n\n"
+                         else:
+                             err_resp = create_openai_error_response(500, s_err, "server_error")
+--- a/app/routes/chat_api.py
++++ b/app/routes/chat_api.py
+@@ -11,6 +11,7 @@
+ from upstreams.express_sdk import ExpressSDKUpstream
+ from upstreams.cookie_proxy import CookieProxyUpstream
+ from api_helpers import extract_upstream_error, create_openai_error_response
++import anti_truncation
+ 
+ # 第二轮：弱网可靠传输 —— 服务端响应缓冲 + 序列号事件 + 断线重放 / 分片轮询。
+ # 上游的读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲，
+@@ -37,6 +38,12 @@
+ async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
+     """按控制台开关分流到两条上游通道（与原来完全一致）。"""
+     if app_state.is_web_proxy_enabled():
++        # 抗截断只实现于 Express 原生通道。Cookie 通道下必须把后缀剥掉，
++        # 否则 "gemini-4-argon-抗截断" 会被当成真实模型名发给上游（必然 404）。
++        base, by_suffix = anti_truncation.split_trigger(request_obj.model)
++        if by_suffix or anti_truncation.settings_enabled():
++            print(f"ℹ️ [抗截断] Cookie（网页反代）通道不支持抗截断，本次按普通模型名发送：{base}")
++            request_obj = request_obj.model_copy(update={"model": base})
+         return await cookie_upstream.chat_completions(request_obj, fastapi_request)
+     else:
+         return await express_upstream.chat_completions(request_obj, fastapi_request)
+--- a/app/upstreams/express_sdk.py
++++ b/app/upstreams/express_sdk.py
+@@ -1,3 +1,4 @@
++import asyncio
+ import re
+ from functools import partial
+ 
+@@ -8,7 +9,7 @@
+ from fastapi.responses import JSONResponse
+ from google import genai
+ 
+-from models import OpenAIRequest
++from models import OpenAIRequest, OpenAIMessage
+ from upstreams.base import BaseUpstream
+ from api_helpers import (
+     create_generation_config,
+@@ -19,6 +20,7 @@
+                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
+ from http_options import get_http_options
+ import model_capabilities as mc
++import anti_truncation
+ from runtime_state import app_state
+ import config as app_config
+ from schema_validation import SchemaValidationError, validate_request_schemas
+@@ -199,6 +201,17 @@
+                 status_code=400,
+                 content=create_openai_error_response(400, model_error, "invalid_request_error"),
+             )
++
++        # 抗截断触发：模型名后缀（-抗截断 / -antitrunc）或控制台开关 anti_truncation。
++        # 后缀必须在**任何按模型名查能力档案的调用之前**剥掉，否则采样/思考档案查不到该模型，
++        # 会按"未知模型"兜底（剥离逻辑与生图判定都会走错分支）。
++        display_model = request_obj.model
++        _at_base, _at_by_suffix = anti_truncation.split_trigger(base_model_name)
++        anti_truncation_wanted = _at_by_suffix or anti_truncation.settings_enabled()
++        if _at_by_suffix:
++            base_model_name = _at_base
++            request_obj = request_obj.model_copy(update={"model": _at_base})
++            print(f"🛡️ [抗截断] 已识别模型名后缀：{display_model} → {_at_base}")
+ 
+         if express_key_manager_instance.get_total_keys() == 0:
+             error_msg = ("未配置任何 Express API Key，无法调用 Gemini Express Mode"
+@@ -306,6 +319,44 @@
+                              "response_modalities", "image_config")}
+             print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
+ 
++        # ===== 抗截断传输分支（默认关闭，机制见 anti_truncation.py 头部说明）=====
++        # 这里是"显式启用"路径：命中后不再走 SDK，而是自己发原生 REST（只有原生
++        # partialArgs 才有分片信息），因此 fake_streaming / 生图假流式都不适用。
++        if anti_truncation_wanted:
++            _at_skip = anti_truncation.skip_reason(
++                request_obj, base_model_name,
++                is_grounded_search=is_grounded_search, is_image_model=is_image_model)
++            if _at_skip:
++                print(f"ℹ️ [抗截断] 本次跳过抗截断，按普通通道发送（原因：{_at_skip}）。")
++            else:
++                _at_tool = anti_truncation.new_tool_name()
++                _at_cont = str(getattr(request_obj, "type", "") or "").lower() == "continue"
++                _at_msgs = list(request_obj.messages) + [
++                    OpenAIMessage(role="user",
++                                  content=anti_truncation.build_instruction(_at_tool, _at_cont))]
++                try:
++                    _at_contents = await asyncio.to_thread(prompt_func, _at_msgs)
++                    return await anti_truncation.handle(
++                        request_obj=request_obj,
++                        base_model_name=base_model_name,
++                        tool_name=_at_tool,
++                        contents=_at_contents,
++                        gen_config_dict=gen_config_dict,
++                        api_key=express_api_key,
++                        model_path=model_to_call,
++                        prefill_text=prefill_text,
++                        continuation=_at_cont,
++                        display_model=display_model,
++                    )
++                except Exception as _at_err:
++                    print(f"❌ [抗截断] 请求失败：{type(_at_err).__name__}: {_at_err}")
++                    return JSONResponse(
++                        status_code=502,
++                        content=create_openai_error_response(
++                            502, f"抗截断请求失败：{type(_at_err).__name__}: {_at_err}",
++                            "upstream_error"),
++                    )
++
+         return await execute_gemini_call(
+             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,
+             fastapi_request=fastapi_request, prefill_text=prefill_text,
