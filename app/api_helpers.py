@@ -1012,6 +1012,9 @@ async def execute_gemini_call(
                             yield f"data: {json.dumps(_pf)}\n\n"
 
                         final_p_tk, final_c_tk, final_t_tk = 0, 0, 0
+                        # 是否见过上游给出的结束原因：没有就说明这一轮是在没有正常收尾的
+                        # 情况下断掉的（连接被掐、上游静默中断），必须显式标记为截断。
+                        _saw_finish = False
 
                         async for chunk_item_call in stream_gen_obj:
                             if getattr(chunk_item_call, "usage_metadata", None):
@@ -1021,6 +1024,10 @@ async def execute_gemini_call(
                             num_candidates = len(chunk_item_call.candidates) if getattr(chunk_item_call, "candidates", None) else 1
                             for ci in range(num_candidates):
                                 has_yielded = True
+                                _cand = (chunk_item_call.candidates[ci]
+                                         if getattr(chunk_item_call, "candidates", None) else None)
+                                if getattr(_cand, "finish_reason", None):
+                                    _saw_finish = True
                                 sse_chunk = convert_chunk_to_openai(
                                     chunk_item_call, request_obj.model, response_id_for_stream, ci,
                                     indexer=tool_indexer)
@@ -1040,6 +1047,18 @@ async def execute_gemini_call(
                         if final_p_tk > 0 or final_c_tk > 0:
                             stats.add_tokens(final_p_tk, final_c_tk)
                             print(f"💰 [算力消耗统计] 提示词: {final_p_tk} | 思考与生成: {final_c_tk} | 总计: {final_t_tk} Tokens")
+
+                        # 上游迭代器正常结束、却自始至终没给过结束原因：这一轮是被掐断的，
+                        # 必须显式标记 finish_reason=length，否则客户端会把半截回复当正常结束。
+                        if not _saw_finish:
+                            print("⚠️ [上游截断] 上游流未给出结束原因就结束了（连接可能被中途掐断）；"
+                                  "已按截断标记 finish_reason=length。")
+                            _cut_end = {"id": response_id_for_stream,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()), "model": request_obj.model,
+                                        "choices": [{"index": 0, "delta": {},
+                                                     "finish_reason": "length"}]}
+                            yield f"data: {json.dumps(_cut_end, ensure_ascii=False)}\n\n"
 
                         # P1-8：Express 真流式此前从不发 usage 块，客户端只能显示 0
                         if wants_usage(request_obj):
@@ -1101,8 +1120,16 @@ async def execute_gemini_call(
                         s_err = str(e_stream_call); s_err = s_err[:1024]+"..." if len(s_err)>1024 else s_err
                         if is_auto_attempt:
                             raise e_stream_call
-                        # 已经输出过内容：不再重发错误体，只补结束标记，避免污染已有输出
+                        # 已经输出过内容：不再重发错误体（避免污染已有输出），但**必须**
+                        # 明确标记这是被截断的一轮。旧行为只补一个 [DONE]，客户端会把
+                        # "后半段丢失"当成正常结束——这正是静默截断的成因。
                         if has_yielded:
+                            print("⚠️ [上游截断] 正文已输出过半，上游中断；已按截断标记 "
+                                  "finish_reason=length（不再重发，避免正文重复）。")
+                            _cut = {"id": response_id_for_stream, "object": "chat.completion.chunk",
+                                    "created": int(time.time()), "model": request_obj.model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+                            yield f"data: {json.dumps(_cut, ensure_ascii=False)}\n\n"
                             yield "data: [DONE]\n\n"
                         else:
                             err_resp = create_openai_error_response(500, s_err, "server_error")

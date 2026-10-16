@@ -1,3 +1,4 @@
+import asyncio
 import re
 from functools import partial
 
@@ -8,7 +9,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from google import genai
 
-from models import OpenAIRequest
+from models import OpenAIRequest, OpenAIMessage
 from upstreams.base import BaseUpstream
 from api_helpers import (
     create_generation_config,
@@ -19,6 +20,7 @@ from message_processing import (create_gemini_prompt, apply_prefill_compat,
                                 apply_console_injection, DEFAULT_IMAGE_PREFILL_NUDGE)
 from http_options import get_http_options
 import model_capabilities as mc
+import anti_truncation
 from runtime_state import app_state
 import config as app_config
 from schema_validation import SchemaValidationError, validate_request_schemas
@@ -200,6 +202,17 @@ class ExpressSDKUpstream(BaseUpstream):
                 content=create_openai_error_response(400, model_error, "invalid_request_error"),
             )
 
+        # 抗截断触发：模型名后缀（-抗截断 / -antitrunc）或控制台开关 anti_truncation。
+        # 后缀必须在**任何按模型名查能力档案的调用之前**剥掉，否则采样/思考档案查不到该模型，
+        # 会按"未知模型"兜底（剥离逻辑与生图判定都会走错分支）。
+        display_model = request_obj.model
+        _at_base, _at_by_suffix = anti_truncation.split_trigger(base_model_name)
+        anti_truncation_wanted = _at_by_suffix or anti_truncation.settings_enabled()
+        if _at_by_suffix:
+            base_model_name = _at_base
+            request_obj = request_obj.model_copy(update={"model": _at_base})
+            print(f"🛡️ [抗截断] 已识别模型名后缀：{display_model} → {_at_base}")
+
         if express_key_manager_instance.get_total_keys() == 0:
             error_msg = ("未配置任何 Express API Key，无法调用 Gemini Express Mode"
                          "（请在控制台「通道与凭证」页添加，或设环境变量 VERTEX_EXPRESS_API_KEY）。")
@@ -305,6 +318,44 @@ class ExpressSDKUpstream(BaseUpstream):
                              "max_output_tokens", "stop_sequences", "thinking_config",
                              "response_modalities", "image_config")}
             print(f"🔎 [出站调试] Express 通道 生成参数={_dbg}")
+
+        # ===== 抗截断传输分支（默认关闭，机制见 anti_truncation.py 头部说明）=====
+        # 这里是"显式启用"路径：命中后不再走 SDK，而是自己发原生 REST（只有原生
+        # partialArgs 才有分片信息），因此 fake_streaming / 生图假流式都不适用。
+        if anti_truncation_wanted:
+            _at_skip = anti_truncation.skip_reason(
+                request_obj, base_model_name,
+                is_grounded_search=is_grounded_search, is_image_model=is_image_model)
+            if _at_skip:
+                print(f"ℹ️ [抗截断] 本次跳过抗截断，按普通通道发送（原因：{_at_skip}）。")
+            else:
+                _at_tool = anti_truncation.new_tool_name()
+                _at_cont = str(getattr(request_obj, "type", "") or "").lower() == "continue"
+                _at_msgs = list(request_obj.messages) + [
+                    OpenAIMessage(role="user",
+                                  content=anti_truncation.build_instruction(_at_tool, _at_cont))]
+                try:
+                    _at_contents = await asyncio.to_thread(prompt_func, _at_msgs)
+                    return await anti_truncation.handle(
+                        request_obj=request_obj,
+                        base_model_name=base_model_name,
+                        tool_name=_at_tool,
+                        contents=_at_contents,
+                        gen_config_dict=gen_config_dict,
+                        api_key=express_api_key,
+                        model_path=model_to_call,
+                        prefill_text=prefill_text,
+                        continuation=_at_cont,
+                        display_model=display_model,
+                    )
+                except Exception as _at_err:
+                    print(f"❌ [抗截断] 请求失败：{type(_at_err).__name__}: {_at_err}")
+                    return JSONResponse(
+                        status_code=502,
+                        content=create_openai_error_response(
+                            502, f"抗截断请求失败：{type(_at_err).__name__}: {_at_err}",
+                            "upstream_error"),
+                    )
 
         return await execute_gemini_call(
             client_to_use, model_to_call, prompt_func, gen_config_dict, request_obj,

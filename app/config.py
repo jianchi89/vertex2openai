@@ -1,4 +1,4 @@
-﻿from typing import Optional
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -77,12 +77,21 @@ DEFAULT_SETTINGS = {
     # 语义：retry_max = 失败后的**重试**次数，总请求次数 = retry_max + 1。
     # 两条通道统一走 api_helpers.get_retry_settings() 读取（会钳位到 0–50）。
     "retry_max": 10,
-    "retry_backoff_seconds": 5,
+    "retry_backoff_seconds": 3.5,
     # 开关（初始值取环境变量）
     "fake_streaming": FAKE_STREAMING_ENABLED,
     "fake_streaming_interval": FAKE_STREAMING_INTERVAL_SECONDS,
     "roundrobin": ROUNDROBIN,
     "safety_score": SAFETY_SCORE,
+    # 抗截断传输（synthetic tool transport，把正文改道进合成函数参数再增量还原）。
+    # 默认关；也可以用模型名后缀按次启用（-抗截断 / -antitrunc），后者不依赖落盘状态，
+    # Render 免费层冷启动也不会丢。见 anti_truncation.py 头部说明。
+    "anti_truncation": False,
+    # 在 /v1/models 里额外暴露哪些模型的抗截断版本（很多客户端只能下拉选，不能手输模型名）。
+    #   ["gemini-4-argon", "gemini-3.8-flash", ...] → 只给这些模型生成 "<模型>-抗截断"
+    #   ["*"]  → 所有可用的文本 Gemini 模型
+    #   []     → 不生成任何抗截断版本（等于把这个功能从模型列表里藏起来）
+    "anti_truncation_models": ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash"],
     # 预填充兼容模式: smart|minimal|off
     # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用某真实酒馆预设
     # （预填充为一段完整句子 + 一个未闭合的思维链开标签）实测 gemini-3.6-flash × 3：

@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Set
 from auth import get_api_key
 from model_loader import get_express_models, refresh_models_config_cache
 from runtime_state import app_state
+import anti_truncation
 
 router = APIRouter()
 _last_model_fetch_time = 0
@@ -26,6 +27,14 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
     
     raw_models = await get_express_models() if (has_express_key or has_web_proxy) else []
 
+    # 抗截断版本：客户端只能从模型列表里选，所以变体必须并进列表（默认只给
+    # gemini-4-argon / 3.8-flash / 3.7-flash，见 anti_truncation.variant_base_models）。
+    try:
+        variant_targets = set(anti_truncation.variant_base_models(raw_models))
+    except Exception as exc:
+        print(f"⚠️ [抗截断] 生成模型变体失败（不影响模型列表）：{exc}")
+        variant_targets = set()
+
     final_model_list: List[Dict[str, Any]] = []
     processed_ids: Set[str] = set()
 
@@ -33,6 +42,8 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
         suffixes = [""]
         if "gemini" in base_id.lower() and "image" not in base_id.lower():
             suffixes.append("-search")
+        if base_id in variant_targets:
+            suffixes.append(anti_truncation.VARIANT_SUFFIX)
 
         for suffix in suffixes:
             final_id = f"{base_id}{suffix}"

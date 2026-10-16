@@ -11,6 +11,7 @@ from runtime_state import app_state
 from upstreams.express_sdk import ExpressSDKUpstream
 from upstreams.cookie_proxy import CookieProxyUpstream
 from api_helpers import extract_upstream_error, create_openai_error_response
+import anti_truncation
 
 # 第二轮：弱网可靠传输 —— 服务端响应缓冲 + 序列号事件 + 断线重放 / 分片轮询。
 # 上游的读取由后台泵任务驱动，与前端连接解绑；Google 的回复总能完整落缓冲，
@@ -37,6 +38,12 @@ cookie_upstream = CookieProxyUpstream()
 async def _call_upstream(request_obj: OpenAIRequest, fastapi_request: Request):
     """按控制台开关分流到两条上游通道（与原来完全一致）。"""
     if app_state.is_web_proxy_enabled():
+        # 抗截断只实现于 Express 原生通道。Cookie 通道下必须把后缀剥掉，
+        # 否则 "gemini-4-argon-抗截断" 会被当成真实模型名发给上游（必然 404）。
+        base, by_suffix = anti_truncation.split_trigger(request_obj.model)
+        if by_suffix or anti_truncation.settings_enabled():
+            print(f"ℹ️ [抗截断] Cookie（网页反代）通道不支持抗截断，本次按普通模型名发送：{base}")
+            request_obj = request_obj.model_copy(update={"model": base})
         return await cookie_upstream.chat_completions(request_obj, fastapi_request)
     else:
         return await express_upstream.chat_completions(request_obj, fastapi_request)
