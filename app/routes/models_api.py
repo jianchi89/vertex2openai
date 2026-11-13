@@ -5,9 +5,27 @@ from auth import get_api_key
 from model_loader import get_express_models, refresh_models_config_cache
 from runtime_state import app_state
 import anti_truncation
+import model_capabilities as mc
 
 router = APIRouter()
 _last_model_fetch_time = 0
+
+
+def _level_suffixes(base_id: str) -> List[str]:
+    """该模型要在模型列表里额外暴露的思考档位变体后缀（默认只给 extra_high）。
+
+    为什么必须并进列表：酒馆手机版等客户端的模型是下拉选择，既不能手输模型名，
+    也没有 reasoning_effort 输入框。把档位做成 ``<模型>-think-<档位>`` 后，刷新模型
+    列表就能直接选到 gemini-4-hydrogen-think-extra-high。
+    """
+    try:
+        prof = mc.get_profile(base_id)
+    except Exception:
+        return []
+    if prof.get("thinking_kind") != "level" or prof.get("is_image"):
+        return []
+    levels = prof.get("thinking_levels") or set()
+    return [mc.level_suffix(lv) for lv in mc.LEVEL_VARIANT_LEVELS if lv in levels]
 
 
 @router.get("/v1/models")
@@ -42,8 +60,16 @@ async def list_models(fastapi_request: Request, api_key: str = Depends(get_api_k
         suffixes = [""]
         if "gemini" in base_id.lower() and "image" not in base_id.lower():
             suffixes.append("-search")
-        if base_id in variant_targets:
+        is_variant = base_id in variant_targets
+        if is_variant:
             suffixes.append(anti_truncation.VARIANT_SUFFIX)
+        # 思考档位变体（默认只有 extra_high，见 mc.LEVEL_VARIANT_LEVELS）：
+        # 有档位的模型直接多一条 "<模型>-think-<档位>"；若该模型同时有抗截断版本，
+        # 再给一条两者叠加的，省得用户在酒馆里二选一。
+        for lv_suf in _level_suffixes(base_id):
+            suffixes.append(lv_suf)
+            if is_variant:
+                suffixes.append(lv_suf + anti_truncation.VARIANT_SUFFIX)
 
         for suffix in suffixes:
             final_id = f"{base_id}{suffix}"

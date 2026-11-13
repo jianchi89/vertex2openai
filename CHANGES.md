@@ -66,3 +66,38 @@
 - 新签名由用户从 Cloud Console 前端 `batchGraphql` 请求（`operationName=StreamGenerateContent`
   的 Payload）抓取：`2/Hc4FpJfYmM+gO5TB0hcjYY0Iwj0rqLIVDZOhurBbu/I=`，已替换旧值；
   旧签名在全代码中零残留。部署后需重启服务生效。
+
+## 第四轮：Gemini 4c / 4h 适配（2026-11-13）
+
+新增两个 4.x 模型：`gemini-4-carbon`（4c）与 `gemini-4-hydrogen`（4h）。两者原先**都没有抗截断变体**；
+4h 还自带一个更高的思考档 `extra_high`，之前代理不认识、列表里也选不到。
+
+- `vertexModels.json` / `app/config.py`：把 4c、4h 加入模型列表与 `anti_truncation_models` 默认值，
+  于是 `/v1/models` 里直接出现 `gemini-4-carbon-抗截断`、`gemini-4-hydrogen-抗截断`。
+- `app/config.py`（新增 `migrate_setting()`）：**旧默认值静默升级**——`web_state.json` 里存着旧默认列表
+  （`["gemini-4-argon","gemini-3.8-flash","gemini-3.7-flash"]`）时会自动升级到含 4c/4h 的新默认值；
+  用户自己改过的列表（包括故意清空的 `[]`）一律不动。`runtime_state` 的 `get_settings`/`get_setting` 都走它。
+- `app/model_capabilities.py`：
+  - 档位阶梯加入 `extra_high`（排在 `high` 之上），`EXTRA_HIGH_MODELS = ("gemini-4-hydrogen",)`
+    命中时该模型档案多一档 `extra_high`；4c 及其它模型没有这一档，收到 `extra_high` 会被
+    `_clamp_level` 就近夹成 `high`（不会拿不支持的枚举去冒 400）。
+  - 新增 **模型名档位后缀** `-think-<档位>`（`split_level_suffix` / `level_suffix`），
+    `resolve_thinking()` 新增 `forced_level`：模型名里的档位是**最强意图**，压过前端
+    `reasoning_effort`、控制台档位、以及"关闭原生思考"/预填充压制的降档，并回传思考
+    （返回值带 `forced` / `forced_over`，通道会打日志说明压过了谁）。
+  - `reasoning_effort` 别名新增 `extra_high`/`extra-high`/`extrahigh`；**`xhigh` 仍映射到 `high`**
+    （保持 README 里"酒馆恒发 xhigh"的既有行为，不会在 4h 上被自动顶到最高档）。
+  - `capabilities_summary` 多返回 `default_level` 与 `variant_levels`，控制台据此提示。
+- `app/routes/models_api.py`：`/v1/models` 为支持该档位的模型额外生成 `<模型>-think-<档位>` 变体
+  （默认只有 `extra_high`，见 `LEVEL_VARIANT_LEVELS`），与抗截断叠加时再给一条
+  `gemini-4-hydrogen-think-extra-high-抗截断`。生图模型不生成。
+- `app/upstreams/express_sdk.py`：新增 `_peel_model_aliases()`，**顺序无关地**反复剥掉
+  `-抗截断` / `-think-<档位>` / `-search` 三种后缀（最多四层），避免叠加变体把假模型名发给上游（404）；
+  `_build_thinking_config()` 接收 `forced_level`。
+- `app/upstreams/cookie_proxy.py`：同样剥离档位后缀；`thinkingLevel` 透传为 `EXTRA_HIGH`
+  （Studio 的枚举未实测，若报未知枚举请改用 Express 通道或选 `high`）。
+- `app/main.py`：控制台「思考档位」下拉新增 `extra_high`（标注"仅 4h"），能力提示里显示
+  默认档位、最高档与对应的模型名变体。
+- 自测：`py_compile` 全绿；另用独立脚本覆盖 45 项断言（档案档位、后缀解析、优先级、夹取、
+  `/v1/models` 变体、抗截断候选、旧值升级），全部通过。
+

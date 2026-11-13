@@ -50,6 +50,38 @@ def _normalize_model_name(model_name: str) -> tuple[str, bool, str | None]:
     return base_model_name, is_grounded_search, None
 
 
+def _peel_model_aliases(model_name: str) -> tuple[str, bool, str | None, bool]:
+    """反复剥掉模型名末尾的别名后缀，返回 (基础模型名, 是否联网搜索, 钉住的思考档位, 是否抗截断)。
+
+    认三种后缀，**顺序无关**（每轮剥一层，最多四层）：
+      - ``-抗截断`` / ``-antitrunc``  抗截断传输（anti_truncation.MODEL_SUFFIXES）
+      - ``-think-<档位>``            思考档位（见 model_capabilities.split_level_suffix）
+      - ``-search``                  联网搜索
+
+    为什么要循环：/v1/models 里会同时出现 ``gemini-4-hydrogen-think-extra-high-抗截断``
+    这种叠加变体，写死"先剥 search 再剥抗截断"就会漏掉其中一个，把带后缀的假模型名
+    发给上游（必然 404）。
+    """
+    name = model_name or ""
+    grounded = False
+    level: str | None = None
+    antitrunc = False
+    for _ in range(4):
+        base, at = anti_truncation.split_trigger(name)
+        if at:
+            name, antitrunc = base, True
+            continue
+        base, lv = mc.split_level_suffix(name)
+        if lv:
+            name, level = base, (level or lv)
+            continue
+        if name.endswith("-search"):
+            name, grounded = name[:-len("-search")], True
+            continue
+        break
+    return name, grounded, level, antitrunc
+
+
 def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
     """选用续写指令：生图模型在用户未自定义时改用要图片的那句。
 
@@ -63,15 +95,26 @@ def _prefill_tpl(user_template: str, is_image_model: bool) -> str:
 
 
 def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_image_model: bool,
-                           prefill_active: bool = False) -> dict | None:
+                           prefill_active: bool = False,
+                           forced_level: str | None = None) -> dict | None:
     """按模型能力档案 + 控制台设置 + 单次请求构建思考配置（SDK 线格式）。
-    生图模型同样下发 thinking_level（三模型默认 HIGH，用户决策 2026-10-13）。"""
+    生图模型同样下发 thinking_level（三模型默认 HIGH，用户决策 2026-10-13）。
+
+    forced_level：模型名后缀（-think-extra-high）钉住的档位。这里显式传进来，
+    因为调用方可能已经把后缀从 request.model 里剥掉了（见 _peel_model_aliases）。
+    """
     settings = app_state.get_effective_settings(base_model_name)
-    t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active)
+    t = mc.resolve_thinking(base_model_name, request, settings, prefill_active=prefill_active,
+                            forced_level=forced_level)
     if t.get("mode") is None:
         return None
 
     thinking_config = {"include_thoughts": t.get("include_thoughts", True)}
+
+    if t.get("forced"):
+        # 模型名后缀钉住的档位：说明它压过了哪个设置，避免"我明明选了关闭原生思考"之类的困惑
+        print(f"🧠 [思考档位] {base_model_name} 按模型名后缀下发 thinking_level={t['level']}"
+              f"（压过：{t.get('forced_over') or '无'}）。")
 
     if t["mode"] == "level":
         genai_version_str = getattr(google.genai, "__version__", "1.0.0")
@@ -202,16 +245,23 @@ class ExpressSDKUpstream(BaseUpstream):
                 content=create_openai_error_response(400, model_error, "invalid_request_error"),
             )
 
-        # 抗截断触发：模型名后缀（-抗截断 / -antitrunc）或控制台开关 anti_truncation。
-        # 后缀必须在**任何按模型名查能力档案的调用之前**剥掉，否则采样/思考档案查不到该模型，
-        # 会按"未知模型"兜底（剥离逻辑与生图判定都会走错分支）。
+        # 别名后缀一次性剥干净：抗截断（-抗截断/-antitrunc）、思考档位（-think-<档位>）、
+        # 联网搜索（-search）。必须在**任何按模型名查能力档案的调用之前**剥掉，否则
+        # 采样/思考档案查不到该模型，会按"未知模型"兜底（剥离逻辑与生图判定都会走错分支），
+        # 而且带后缀的假模型名会被发给上游（必然 404）。
         display_model = request_obj.model
-        _at_base, _at_by_suffix = anti_truncation.split_trigger(base_model_name)
-        anti_truncation_wanted = _at_by_suffix or anti_truncation.settings_enabled()
-        if _at_by_suffix:
-            base_model_name = _at_base
-            request_obj = request_obj.model_copy(update={"model": _at_base})
-            print(f"🛡️ [抗截断] 已识别模型名后缀：{display_model} → {_at_base}")
+        _peel_base, _peel_search, forced_level, _peel_at = _peel_model_aliases(base_model_name)
+        anti_truncation_wanted = _peel_at or anti_truncation.settings_enabled()
+        if _peel_base != base_model_name:
+            base_model_name = _peel_base
+            is_grounded_search = is_grounded_search or _peel_search
+            if _peel_at:
+                print(f"🛡️ [抗截断] 已识别模型名后缀：{display_model} → {base_model_name}")
+            if forced_level:
+                print(f"🧠 [思考档位] 模型名后缀指定档位：{display_model} → {base_model_name}"
+                      f"（thinking_level={forced_level}）")
+            # 下游一律用剥干净的基础名（查档案、拼上游路径、回包里的 model 字段）
+            request_obj = request_obj.model_copy(update={"model": base_model_name})
 
         if express_key_manager_instance.get_total_keys() == 0:
             error_msg = ("未配置任何 Express API Key，无法调用 Gemini Express Mode"
@@ -294,7 +344,8 @@ class ExpressSDKUpstream(BaseUpstream):
 
         gen_config_dict = create_generation_config(request_obj)
         thinking_config = _build_thinking_config(base_model_name, request_obj, is_image_model,
-                                                 prefill_active=prefill_active)
+                                                 prefill_active=prefill_active,
+                                                 forced_level=forced_level)
         if thinking_config:
             gen_config_dict["thinking_config"] = thinking_config
 

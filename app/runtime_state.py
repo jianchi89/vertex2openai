@@ -229,14 +229,14 @@ class AppState:
             if isinstance(stored, dict):
                 for k, v in stored.items():
                     if k in merged:
-                        merged[k] = copy.deepcopy(v)
+                        merged[k] = app_config.migrate_setting(k, copy.deepcopy(v))
             return merged
 
     def get_setting(self, key: str, default=None):
         with self._lock:
             stored = self._state.get("settings")
             if isinstance(stored, dict) and key in stored:
-                return copy.deepcopy(stored[key])
+                return app_config.migrate_setting(key, copy.deepcopy(stored[key]))
             if key in app_config.DEFAULT_SETTINGS:
                 return copy.deepcopy(app_config.DEFAULT_SETTINGS[key])
             return default

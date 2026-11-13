@@ -1,4 +1,7 @@
 from typing import Optional
+
+import copy
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -60,7 +63,7 @@ VERTEX_REASONING_TAG = REASONING_TAG
 # ============================================================
 DEFAULT_SETTINGS = {
     # 思考
-    "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high
+    "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high|extra_high（extra_high 仅 4h 系模型支持，其它模型自动就近夹到 high）
     # 生图
     "image_size": "4K",                   # 默认分辨率: 512|1K|2K|4K（按模型白名单校验）
     "image_aspect_ratio": "",             # 默认宽高比, ""=自动
@@ -91,7 +94,8 @@ DEFAULT_SETTINGS = {
     #   ["gemini-4-argon", "gemini-3.8-flash", ...] → 只给这些模型生成 "<模型>-抗截断"
     #   ["*"]  → 所有可用的文本 Gemini 模型
     #   []     → 不生成任何抗截断版本（等于把这个功能从模型列表里藏起来）
-    "anti_truncation_models": ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash"],
+    "anti_truncation_models": ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen",
+                               "gemini-3.8-flash", "gemini-3.7-flash"],
     # 预填充兼容模式: smart|minimal|off
     # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用某真实酒馆预设
     # （预填充为一段完整句子 + 一个未闭合的思维链开标签）实测 gemini-3.6-flash × 3：
@@ -172,6 +176,33 @@ DEFAULT_SETTINGS = {
     # 仅覆盖“与模型相关”的参数（见 PER_MODEL_KEYS）；优先级 请求 > 模型专属 > 全局 > 内置。
     "model_overrides": {},
 }
+
+
+# ============================================================
+# 旧默认值 → 新默认值的静默升级
+# ============================================================
+# 背景：web_state.json 里存着用户曾经保存过的设置，而 DEFAULT_SETTINGS 只在
+# “这个键从没被保存过”时生效。于是把新模型加进默认列表时，只要用户保存过一次
+# 设置（哪怕保存的是旧默认值本身），新模型就永远进不了模型列表——列表里看不到
+# gemini-4-carbon-抗截断 之类的新变体，还查不出原因。
+#
+# 这里只对**完全等于旧默认值**的持久化值做升级：用户自己改过的列表一律不动
+# （包括故意清空成 [] 的情况）。
+_SETTINGS_UPGRADES = {
+    "anti_truncation_models": [
+        (["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash"],
+         ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen",
+          "gemini-3.8-flash", "gemini-3.7-flash"]),
+    ],
+}
+
+
+def migrate_setting(key: str, value):
+    """把某个持久化设置值按升级表迁移到当前默认值；没有升级规则就原样返回。"""
+    for old, new in _SETTINGS_UPGRADES.get(key, []):
+        if isinstance(value, (list, tuple)) and list(value) == list(old):
+            return copy.deepcopy(new)
+    return value
 
 # 允许按模型单独保存（覆盖全局默认）的参数键。
 # 其余为基础设施级（图压缩/重试/假流式/预填充/安全分/调试等），保持全局唯一。

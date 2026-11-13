@@ -447,8 +447,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="card p-5">
         <div class="text-sm font-semibold mb-3">思考强度</div>
         <div class="mb-3" id="wrap-g3level">
-          <div class="lbl mb-1">Gemini 3.x 思考档位（thinking_level）</div>
-          <select id="thinking_g3_level" class="inp"><option value="">自动（按模型默认）</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
+          <div class="lbl mb-1">Gemini 3.x / 4.x 思考档位（thinking_level）</div>
+          <select id="thinking_g3_level" class="inp"><option value="">自动（按模型默认）</option><option value="minimal">minimal</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="extra_high">extra_high（仅 4h）</option></select>
         </div>
         <p id="think-note" class="text-xs text-neutral-500 mt-2"></p>
         <div class="mt-3 pt-3 border-t border-neutral-100">
@@ -1000,7 +1000,13 @@ function renderCaps(){
   $('wrap-g3level').style.opacity=isLevel?'1':'.4';
   let tn='';
   if(cap.is_image) tn='生图模型思考档位（默认 high，可在上方调整）。';
-  else if(isLevel) tn='该模型用思考档位' + ((th.levels && !th.levels.includes('minimal')) ? '（此模型最低 low，无 minimal，且无法关闭）' : '（无法完全关闭，最省为 minimal）') + '。';
+  else if(isLevel){
+    tn='该模型用思考档位' + ((th.levels && !th.levels.includes('minimal')) ? '（此模型最低 low，无 minimal，且无法关闭）' : '（无法完全关闭，最省为 minimal）');
+    if(th.levels && th.levels.includes('extra_high')) tn+='；本模型最高档 extra_high';
+    if(th.default_level) tn+='，默认 ' + th.default_level;
+    tn+='。';
+    if(th.variant_levels && th.variant_levels.length) tn+=' 模型列表里另有 ' + th.variant_levels.map(l=>'<' + m + '-think-' + l.replace(/_/g,'-') + '>').join('、') + '，在前端下拉里选它即可钉住该档位（压过前端 effort 与控制台档位）。';
+  }
   else tn='该模型不支持思考调节。';
   $('think-note').textContent=tn;
 

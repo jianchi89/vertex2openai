@@ -144,6 +144,10 @@ http://localhost:8050
 - **采样参数弃用**：自 **Gemini 3.6 Flash / 3.5 Flash-Lite 起（及所有更新/未来模型）**，`temperature`/`top_p`/`top_k` 已废弃（现被忽略、未来返回 400），代理会**自动移除**；更早的 3.x（如 3.0–3.5 非 lite）仍可用，但官方建议保持默认。
 - **`candidate_count`**：所有 Gemini 3.x 不支持，自动移除。
 - **思考**：Gemini 3.x 用 `thinking_level`（`minimal`/`low`/`medium`/`high`，不可完全关闭；各模型默认不同，如 3.6-flash=medium、pro=high、flash-lite=minimal）；
+  - **`gemini-4-carbon` / `gemini-4-hydrogen`（2026-11 新增，档位/能力已适配）**：两者都是 4.x 文本模型（采样参数按"已废弃"自动剥离，预填充/思考/搜索全部自动生效）。**`gemini-4-hydrogen` 多一档 `extra_high`**（比 `high` 更高，线上取值 `thinking_level="extra_high"`；`gemini-4-carbon` 没有这一档，给它发 `extra_high` 会 400，代理会自动就近夹成 `high`）。
+    - **怎么用上 `extra_high`**：`/v1/models` 会为 4h 额外生成 **`gemini-4-hydrogen-think-extra-high`** 这个模型变体（因为很多客户端只能下拉选模型、既不能手输模型名也没有 `reasoning_effort` 输入框）。在酒馆里把模型切到它，就钉住了 `extra_high`；它还会和抗截断叠加成 `gemini-4-hydrogen-think-extra-high-抗截断`。
+    - **优先级**：模型名里的 `-think-<档位>` 是**最强意图**——压过前端 `reasoning_effort`、控制台档位，也压过"关闭原生思考"/预填充压制的降档（并会回传思考）。日志里会打一行 `🧠 [思考档位] ...（压过：xxx）` 说明它压过了谁。
+    - 控制台「思考档位」下拉也多了 `extra_high` 一项（仅对支持该档位的模型生效，其它模型自动夹到 `high`）。档位后缀写法很宽松：`-think-extra-high` / `-think-extra_high` / `-think-xhigh` 都认（`xhigh` 在支持 extra_high 的模型上等于 extra_high，其它模型仍按 `high` 处理，保持原有"前端恒发 xhigh"的行为不变）。
   - **`gemini-3.7-flash`（2026-08 新增）**：官方默认档位 **`medium`**（取代旧 3.x 的 `high`），档位表只提供 **`low`/`medium`/`high`——没有 `minimal`**（出处：`intro_gemini_3_7_flash.ipynb`）。因此在 3.7 上选「关闭原生思考」会压到 `low`（就近合法档），而不是发一个不支持的枚举去冒 400 风险。同理，**3.7 及更新/未知型号一律不提供 `minimal`**，等真机验证后再逐个放开；`thinking_level` 与旧的 `thinking_budget` **不可同时出现**（官方明确会 400），本代理只会二选一。Gemini 2.5 用 `thinking_budget`（`-1` 动态；2.5-flash 可设 `0` 关闭，2.5-pro 最低 128）。
   - **原生思考控制（`native_thinking_mode`）**——控制台"思考强度"卡片的下拉，支持"保存为该模型专属"：
     - **跟随请求（默认）**：用前端发来的 `reasoning_effort`。⚠️ SillyTavern 等前端常在**每次请求都发 `reasoning_effort`（如 `xhigh`）**，会覆盖你在控制台设的档位。
@@ -343,6 +347,10 @@ curl http://localhost:8050/v1/chat/completions \
 ```json
 {
   "models": [
+    "gemini-4-argon",
+    "gemini-4-carbon",
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
@@ -350,9 +358,9 @@ curl http://localhost:8050/v1/chat/completions \
     "gemini-3.1-pro-preview",
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-image",
+    "gemini-nano-banana-2.1",
     "gemini-3-pro-image",
-    "gemini-2.5-pro",
-    "gemini-2.5-flash"
+    "gemini-3-flash-preview"
   ]
 }
 ```
@@ -363,6 +371,17 @@ curl http://localhost:8050/v1/chat/completions \
 > - `gemini-3.1-flash-image` / `gemini-3-pro-image`：GA 版本（不带 `-preview`），对应的 `-preview` 版本已于 2026-06-25 停用。
 
 `/v1/models` 会自动为**非生图**的 Gemini 模型生成带 `-search` 后缀的别名。新增模型只需把 ID 加进此列表即可（能力自动归类，无需改代码）。
+
+除 `-search` 外，`/v1/models` 还会按需生成两类**客户端可直接下拉选中**的变体（都不需要手输模型名）：
+
+| 变体 | 什么时候出现 | 作用 |
+|---|---|---|
+| `<模型>-抗截断` | 该模型在 `anti_truncation_models` 里（默认含 `gemini-4-argon` / `gemini-4-carbon` / `gemini-4-hydrogen` / `3.8-flash` / `3.7-flash`） | 走抗截断传输（合成函数通道，模型被输出上限/安全过滤打断时也把已收到的正文交出来） |
+| `<模型>-think-extra-high` | 该模型支持 `extra_high` 档（目前只有 `gemini-4-hydrogen`） | 钉住思考档位 `extra_high`，压过前端 `reasoning_effort` 与控制台档位 |
+| `<模型>-think-extra-high-抗截断` | 上面两条同时成立 | 抗截断 + `extra_high` 一起用 |
+
+> 💡 想给别的模型也加抗截断变体：控制台改 `anti_truncation_models`（或直接调 `POST /api/settings`）即可，`["*"]` 表示所有文本 Gemini 模型。
+> 💡 想让别的档位也出现在模型列表里：往 `app/model_capabilities.py` 的 `LEVEL_VARIANT_LEVELS` 里加（默认只有 `extra_high`，全档位都生成会让列表从 20 条膨胀到 40+ 条）。
 
 ---
 
