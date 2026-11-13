@@ -17,7 +17,7 @@
 """
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from models import normalize_content_part
 
@@ -49,7 +49,19 @@ _NANO_BANANA_ARS = _PRO_IMAGE_ARS
 #   MINIMAL 仅 Gemini 3 Flash / 3.1 Flash-Lite 有；
 #   MEDIUM 覆盖 Gemini 3 Flash / 3.1 Pro / 3.1 Flash-Lite；
 #   LOW / HIGH 所有 3.x 都有。
-_LEVEL_ORDER = ["minimal", "low", "medium", "high"]
+# 2026-11 新增：gemini-4-hydrogen 自带更高的 EXTRA_HIGH 档（线上取值 "extra_high"）。
+#   阶梯里必须把它排在 high 之上，否则 _clamp_level 的"就近向下取"会把它夹成 high。
+_LEVEL_ORDER = ["minimal", "low", "medium", "high", "extra_high"]
+
+#: 提供 EXTRA_HIGH 档的模型（前缀匹配，``gemini-4-hydrogen-preview`` 也算）。
+#: 只写 4h 系：4c 没有这一档，给它下发 extra_high 会 400。
+EXTRA_HIGH_MODELS = ("gemini-4-hydrogen",)
+
+
+def _supports_extra_high(name: str) -> bool:
+    """该型号是否有 EXTRA_HIGH 档。"""
+    n = (name or "").lower()
+    return any(n == m or n.startswith(m + "-") for m in EXTRA_HIGH_MODELS)
 
 # MINIMAL 的可用性上界（含）：3.6 及更早的非 Pro 机型实测/文档支持 MINIMAL
 # （3.6-flash 已真机验证 MINIMAL 生效、思考归零）。
@@ -106,8 +118,73 @@ def _strip_known_suffixes(name: str) -> str:
     for suf in ("-search", "-1k", "-2k", "-4k", "-512"):
         if n.endswith(suf):
             n = n[: -len(suf)]
-    n = re.sub(r"-think-(minimal|low|medium|high|off|none)$", "", n)
+    n = re.sub(r"-think-(extra[-_]?high|minimal|low|medium|high|off|none)$", "", n)
     return n
+
+
+# ---------------------------------------------------------------- 档位后缀（-think-<档位>）
+# 为什么要有：很多客户端（酒馆手机版、TauriTavern 等）的模型是**下拉选择**、不能手输
+# 模型名，也没法发 reasoning_effort。把档位写进模型名（``gemini-4-hydrogen-think-extra-high``）
+# 就成了唯一能"选中某一档"的方式，而且不依赖落盘状态（冷启动不丢）。
+#
+# 语义：模型名里的档位是**最强意图**——优先于前端 reasoning_effort、控制台档位，
+# 也优先于预填充压制/「关闭原生思考」的降档（见 resolve_thinking 里的注释）。
+
+LEVEL_SUFFIX_PREFIX = "-think-"
+
+#: 认得的档位词（含客户端常见的几种写法）
+_LEVEL_TOKENS = {
+    "minimal", "low", "medium", "high",
+    "extra_high", "extra-high", "extrahigh", "xhigh", "x-high",
+    "off", "none",
+}
+
+
+def _norm_level_token(token: str) -> Optional[str]:
+    """把后缀里的档位词归一成档案里的档位名；不认识返回 None。"""
+    t = (token or "").strip().lower()
+    if t not in _LEVEL_TOKENS:
+        return None
+    t = t.replace("-", "_")
+    if t in ("extrahigh", "xhigh"):
+        # xhigh / x-high 是客户端对"最高档"的叫法：在支持 EXTRA_HIGH 的模型上就用它，
+        # 其余模型由 _clamp_level 就近夹回 high
+        t = "extra_high"
+    if t in ("off", "none"):
+        # 老写法 -think-off / -think-none：Gemini 3.x 起无法真正关闭思考，压到最低合法档
+        t = "minimal"
+    return t
+
+
+def split_level_suffix(name: str) -> Tuple[str, Optional[str]]:
+    """识别模型名末尾的思考档位后缀，返回 (去掉后缀的基础名, 档位或 None)。
+
+    只认**末尾**那一段：``gemini-4-hydrogen-think-extra-high`` → ("gemini-4-hydrogen",
+    "extra_high")；``gemini-4-hydrogen-think-foo`` 原样返回（不猜）。
+    """
+    n = (name or "").strip()
+    low = n.lower()
+    idx = low.rfind(LEVEL_SUFFIX_PREFIX)
+    if idx <= 0:
+        return n, None
+    level = _norm_level_token(low[idx + len(LEVEL_SUFFIX_PREFIX):])
+    if level is None:
+        return n, None
+    base = n[:idx].strip().strip("-_ ")
+    if not base:
+        return n, None
+    return base, level
+
+
+def level_suffix(level: str) -> str:
+    """档位 → 模型名后缀（extra_high → "-think-extra-high"）。"""
+    return LEVEL_SUFFIX_PREFIX + str(level or "").strip().lower().replace("_", "-")
+
+
+#: 默认在 /v1/models 里为「支持该档位」的模型生成 ``<模型>-think-<档位>`` 变体。
+#: 只放"新增/高价值"的档位，不给 minimal/low/medium/high 都生成——那会让模型列表
+#: 从 12 条膨胀到 40+ 条，酒馆下拉反而更难选。想加别的档位直接往这里加即可。
+LEVEL_VARIANT_LEVELS = ("extra_high",)
 
 
 def _temp_deprecated(name: str) -> bool:
@@ -187,6 +264,9 @@ def get_profile(model_name: str) -> Dict[str, Any]:
         levels = {"low", "medium", "high"}
         if _supports_minimal(major, minor, is_pro):
             levels = levels | {"minimal"}
+        if _supports_extra_high(name):
+            # gemini-4-hydrogen：比 high 更高的 EXTRA_HIGH（线上取值 extra_high）
+            levels = levels | {"extra_high"}
         if "flash-lite" in name and "minimal" in levels:
             default_level = "minimal"
         elif is_pro:
@@ -230,6 +310,12 @@ _EFFORT_ALIASES = {
     "low": "low", "medium": "medium", "med": "medium",
     "high": "high", "max": "high", "xhigh": "high", "x-high": "high", "very_high": "high",
     "none": "off", "off": "off",
+    # EXTRA_HIGH（gemini-4-hydrogen 起才有）：只有明确写出来才用，不把前端惯发的
+    # xhigh 自动升上来——xhigh 一直映射到 high（见上），否则酒馆默认请求会在 4h 上
+    # 直接跑最高档，正是 README 里"思考跑飞"的成因。想用就在模型名里选
+    # gemini-4-hydrogen-think-extra-high。
+    "extra_high": "extra_high", "extra-high": "extra_high", "extrahigh": "extra_high",
+    "extra high": "extra_high",
 }
 
 
@@ -256,13 +342,31 @@ def _extra(request: Any, key: str) -> Any:
     return v
 
 
+def forced_level_of(request: Any, model_name: str = "") -> Optional[str]:
+    """本次请求被模型名后缀钉住的思考档位（``-think-extra-high`` → "extra_high"）。
+
+    两处都看：``request.model`` 是客户端**原样发来的**模型名（通道内部可能已经把后缀
+    剥掉才去调上游，所以不能只看 model_name），``model_name`` 是调用方手里的基础名。
+    """
+    for candidate in (getattr(request, "model", "") or "", model_name or ""):
+        try:
+            level = split_level_suffix(candidate)[1]
+        except Exception:
+            level = None
+        if level:
+            return level
+    return None
+
+
 def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
-                     prefill_active: bool = False) -> Dict[str, Any]:
+                     prefill_active: bool = False,
+                     forced_level: Optional[str] = None) -> Dict[str, Any]:
     """
     计算思考配置（中立结构，各通道再转成自己的线格式）。
     返回 {"mode": None} 或 {"mode":"level","level":..}
 
     优先级（默认）：单次请求 reasoning_effort > 控制台/该模型专属 > 家族默认。
+    **例外：模型名里的档位后缀（-think-<档位>）压过以上全部**——见下。
 
     控制台 native_thinking_mode（原生思考控制，向后兼容旧 hide_thoughts/thinking_force_console 布尔）：
     - "request"（默认）：跟随请求 effort（无则控制台/模型默认），返回思考。
@@ -273,12 +377,19 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
     - "console"（强制控制台档位）：忽略前端 effort，用控制台/该模型专属档位（未设则模型默认），返回思考。
 
     另外 prefill_suppress_thinking（默认开）：检测到预填充时等效走 "off" 压制路径。
+
+    模型名档位后缀（2026-11 新增）：用户在客户端下拉里选的 ``xxx-think-extra-high`` 是
+    **一次性的、最具体的意图**，所以它优先于前端 effort、控制台档位、以及上面那两条
+    降档路径（off / 预填充压制），并且 include_thoughts=True（既然明确要这一档，就把
+    思考一起回传，否则"选了 extra high 却看不到思考"更让人困惑）。返回值里带
+    ``"forced": True``，通道可据此打一行日志说明压过了哪个设置。
     """
     prof = get_profile(model_name)
     if prof["thinking_kind"] is None:
         return {"mode": None}
 
     settings = settings or {}
+    forced = forced_level or forced_level_of(request, model_name)
 
     # 统一的“原生思考控制”模式：request（跟随请求）| off（关闭原生思考）| console（强制控制台档位）
     # 向后兼容旧布尔开关（上一版的 hide_thoughts / thinking_force_console）。
@@ -300,6 +411,13 @@ def resolve_thinking(model_name: str, request: Any, settings: Dict[str, Any],
 
     if prof["thinking_kind"] == "level":
         levels = prof["thinking_levels"]
+        if forced:
+            # 模型名后缀优先：仍按该模型的合法档位夹一次（别的模型没有 extra_high）
+            return {"mode": "level", "level": _clamp_level(forced, levels),
+                    "include_thoughts": True, "forced": True,
+                    "forced_over": ("off" if suppress else
+                                    "console" if mode == "console" else
+                                    "request" if _effort(request) else None)}
         if suppress:
             # 压制：3.x 无法完全关闭思考 → 压到该模型最低合法档并隐藏
             return {"mode": "level", "level": _clamp_level("minimal", levels),
@@ -454,9 +572,13 @@ def capabilities_summary(model_name: str, settings: Optional[Dict[str, Any]] = N
         prof = apply_sampling_policy(prof, settings)
     thinking: Dict[str, Any] = {"kind": prof["thinking_kind"]}
     if prof["thinking_kind"] == "level":
-        # 按强度排序（minimal→high），不要用字典序（会排成 high, low, medium, minimal）
+        # 按强度排序（minimal→extra_high），不要用字典序（会排成 high, low, medium, minimal）
         thinking["levels"] = sort_levels(prof["thinking_levels"])
         thinking["can_off"] = False
+        thinking["default_level"] = prof.get("default_level")
+        # 这些档位在 /v1/models 里各有对应的 "<模型>-think-<档位>" 变体，客户端下拉可直接选
+        thinking["variant_levels"] = [lv for lv in LEVEL_VARIANT_LEVELS
+                                      if lv in prof["thinking_levels"]]
     return {
         "family": prof["family"],
         "is_image": prof["is_image"],

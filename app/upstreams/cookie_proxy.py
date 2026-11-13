@@ -207,13 +207,19 @@ def _build_thinking_config(model_name: str, request: OpenAIRequest,
                            prefill_active: bool = False) -> Optional[dict]:
     """
     按模型能力档案 + 控制台设置 + 单次请求构建 thinkingConfig：
-    - Gemini 3 及以上（含生图模型）：thinkingLevel（MINIMAL/LOW/MEDIUM/HIGH，生图默认 HIGH）
+    - Gemini 3 及以上（含生图模型）：thinkingLevel（MINIMAL/LOW/MEDIUM/HIGH，生图默认 HIGH；
+      gemini-4-hydrogen 起多一档 EXTRA_HIGH）
     - 其它：None
     prefill_active=True 时按控制台开关压制思考（见 mc.resolve_thinking）。
     """
     settings = app_state.get_effective_settings(model_name)
     t = mc.resolve_thinking(model_name, request, settings, prefill_active=prefill_active)
+    if t.get("forced"):
+        print(f"🧠 [思考档位] {model_name} 按模型名后缀下发 thinkingLevel={str(t['level']).upper()}"
+              f"（压过：{t.get('forced_over') or '无'}）。")
     if t.get("mode") == "level":
+        # extra_high → EXTRA_HIGH（Studio 的枚举没实测过，先按同名大写透传；
+        # 若 Studio 报未知枚举，就用 Express 通道或改选 high）
         return {"thinkingLevel": t["level"].upper(), "includeThoughts": t.get("include_thoughts", True)}
     if t.get("mode") == "budget":
         return {"thinkingBudget": t["budget"], "includeThoughts": t.get("include_thoughts", True)}
@@ -1348,6 +1354,13 @@ class CookieProxyUpstream(BaseUpstream):
         base_model_name = model_display
         if base_model_name.endswith("-search"):
             base_model_name = base_model_name[:-len("-search")]
+        # 思考档位后缀（-think-extra-high 等）：同样要剥掉再发上游。request.model 保持
+        # 原样不动，档位由 mc.resolve_thinking 从里面读（mc.forced_level_of）。
+        _lv_base, _lv_level = mc.split_level_suffix(base_model_name)
+        if _lv_level:
+            base_model_name = _lv_base
+            print(f"🧠 [思考档位] 模型名后缀指定档位：{model_display} → {_lv_base}"
+                  f"（thinkingLevel={_lv_level.upper()}）")
 
         # ===== 3.5 预填充智能兼容（按控制台模式 + 模型能力；新模型自动生效）=====
         _profile = mc.get_profile(base_model_name)
