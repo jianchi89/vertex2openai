@@ -49,19 +49,41 @@ _NANO_BANANA_ARS = _PRO_IMAGE_ARS
 #   MINIMAL 仅 Gemini 3 Flash / 3.1 Flash-Lite 有；
 #   MEDIUM 覆盖 Gemini 3 Flash / 3.1 Pro / 3.1 Flash-Lite；
 #   LOW / HIGH 所有 3.x 都有。
-# 2026-11 新增：gemini-4-hydrogen 自带更高的 EXTRA_HIGH 档（线上取值 "extra_high"）。
+# 2026-11 新增：gemini-4-hydrogen / gemini-4-neon 自带更高的 EXTRA_HIGH 档
+#   （线上取值默认 "extra_high"，可用 settings["extra_high_wire"] 改成 "xhigh"，
+#     见下方 EXTRA_HIGH_WIRE_DEFAULT 的注释）。
 #   阶梯里必须把它排在 high 之上，否则 _clamp_level 的"就近向下取"会把它夹成 high。
 _LEVEL_ORDER = ["minimal", "low", "medium", "high", "extra_high"]
 
 #: 提供 EXTRA_HIGH 档的模型（前缀匹配，``gemini-4-hydrogen-preview`` 也算）。
-#: 只写 4h 系：4c 没有这一档，给它下发 extra_high 会 400。
-EXTRA_HIGH_MODELS = ("gemini-4-hydrogen",)
+#: 只写 4h / 4n 系：4c、4-argon 没有这一档，给它们下发 extra_high 会 400。
+#: 2026-11-19 新增 gemini-4-neon（上游模型清单里与 4h 同属"四档思考 / 64K"那一类）。
+EXTRA_HIGH_MODELS = ("gemini-4-hydrogen", "gemini-4-neon")
 
 
 def _supports_extra_high(name: str) -> bool:
     """该型号是否有 EXTRA_HIGH 档。"""
     n = (name or "").lower()
     return any(n == m or n.startswith(m + "-") for m in EXTRA_HIGH_MODELS)
+
+
+#: EXTRA_HIGH 这一档下发给上游时的**线格式取值**。
+#: 两个来源说法不一致，所以不写死：
+#:   - 2026-11-13 用户确认 4h 的取值是 "extra_high"；
+#:   - 上游模型清单（bad-woman/vertex2openai 的 vertexModels.json）把同一档写成 "xhigh"。
+#: 谁对取决于端点/时期。控制台接口可用 settings["extra_high_wire"] 覆盖（"" = 用这里的默认）。
+#: 若日志里出现 400 且提到未知枚举/档位，先把 extra_high_wire 改成 "xhigh" 再试：
+#:   curl -X POST <反代>/api/settings -H "Authorization: Bearer <API_KEY>" \
+#:        -H "Content-Type: application/json" -d '{"extra_high_wire":"xhigh"}'
+EXTRA_HIGH_WIRE_DEFAULT = "extra_high"
+
+
+def wire_level(level: str, settings: Optional[Dict[str, Any]] = None) -> str:
+    """内部档位名 → 下发给上游的取值（目前只有 extra_high 需要转换）。"""
+    if str(level or "").strip().lower() != "extra_high":
+        return level
+    override = str((settings or {}).get("extra_high_wire") or "").strip()
+    return override or EXTRA_HIGH_WIRE_DEFAULT
 
 # MINIMAL 的可用性上界（含）：3.6 及更早的非 Pro 机型实测/文档支持 MINIMAL
 # （3.6-flash 已真机验证 MINIMAL 生效、思考归零）。

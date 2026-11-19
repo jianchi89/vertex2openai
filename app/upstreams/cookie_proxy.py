@@ -218,9 +218,10 @@ def _build_thinking_config(model_name: str, request: OpenAIRequest,
         print(f"🧠 [思考档位] {model_name} 按模型名后缀下发 thinkingLevel={str(t['level']).upper()}"
               f"（压过：{t.get('forced_over') or '无'}）。")
     if t.get("mode") == "level":
-        # extra_high → EXTRA_HIGH（Studio 的枚举没实测过，先按同名大写透传；
-        # 若 Studio 报未知枚举，就用 Express 通道或改选 high）
-        return {"thinkingLevel": t["level"].upper(), "includeThoughts": t.get("include_thoughts", True)}
+        # extra_high → EXTRA_HIGH（Studio 的枚举没实测过；取值本身可由 settings["extra_high_wire"]
+        # 覆盖，见 mc.EXTRA_HIGH_WIRE_DEFAULT。若 Studio 报未知枚举，就用 Express 通道或改选 high）
+        return {"thinkingLevel": mc.wire_level(t["level"], settings).upper(),
+                "includeThoughts": t.get("include_thoughts", True)}
     if t.get("mode") == "budget":
         return {"thinkingBudget": t["budget"], "includeThoughts": t.get("include_thoughts", True)}
     return None

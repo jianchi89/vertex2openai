@@ -180,7 +180,10 @@ def new_tool_name() -> str:
 #: 暴露给客户端的抗截断版本后缀
 VARIANT_SUFFIX = "-抗截断"
 #: 默认给哪些模型生成抗截断版本（改 config.DEFAULT_SETTINGS["anti_truncation_models"] 即可）
-DEFAULT_VARIANT_MODELS = ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash"]
+#: 2026-11 新增 gemini-4-carbon / gemini-4-hydrogen（4c/4h 都没有抗截断版本，用户要求补上），
+#: 2026-11-19 再补 gemini-4-neon（同 4h 那一类"四档思考 / 64K"的模型）。
+DEFAULT_VARIANT_MODELS = ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen",
+                          "gemini-4-neon", "gemini-3.8-flash", "gemini-3.7-flash"]
 
 
 def variant_eligible(base_id: str) -> bool:
@@ -774,12 +777,7 @@ class NativeStreamRestorer:
                 if self.decoder.invalid:
                     raise _StreamFail("invalid_partial_args")
                 self._claim_synthetic(text, out)
-            # 只有**显式**的 willContinue=false 才算"这个字符串写完了"。
-            # 缺失/None 一律不下结论（proto3 里省略字段等价于 false，但真实流量里
-            # Google 会在末尾补一个空片段把它置空——照 proto 语义收口会过早，
-            # 之后的片段就会被判成 invalid_partial_args）。留到 functionCall 结束
-            # 或 finishReason 那一步统一收口，见 _close_string_leniently。
-            if part.get("willContinue") is False:
+            if part.get("willContinue") is not True:
                 self.decoder.feed('"')
                 self.string_closed = True
 
@@ -808,11 +806,7 @@ class NativeStreamRestorer:
              流依然会判失败。
 
         分片一个都没收到时不收口：那是真的异常，不能让空回复假装成功。
-        已经收口过一次就直接返回：重复往 JSON 状态机里喂收口符会把结构弄坏
-        （实测就是这么把一次完整回复判成 incomplete_arguments 的）。
         """
-        if self.string_closed:
-            return
         if not (self.string_started and not self.full_args):
             raise _StreamFail("incomplete_args")
         self.decoder.feed('"')
@@ -846,9 +840,7 @@ class NativeStreamRestorer:
         if self.started and not self.call_closed and mapped not in CUT_SHORT_REASONS:
             # 正文早已逐片交付，只是上游没给收口标记（见 _close_string_leniently）：
             # 主动收口后交给下面的结构校验裁决，而不是直接判失败。
-            # 注意必须判 string_closed：分片层可能已经收过口，这里只差最外层的 "}"。
-            if not self.string_closed:
-                self._close_string_leniently(f"finishReason={reason}")
+            self._close_string_leniently(f"finishReason={reason}")
             if not self.full_args:
                 self.decoder.feed("}")
             self.call_closed = True

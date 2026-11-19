@@ -63,7 +63,10 @@ VERTEX_REASONING_TAG = REASONING_TAG
 # ============================================================
 DEFAULT_SETTINGS = {
     # 思考
-    "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high|extra_high（extra_high 仅 4h 系模型支持，其它模型自动就近夹到 high）
+    "thinking_g3_level": "",              # 空=按模型各自默认(3.6-flash=medium/pro=high/flash-lite=minimal)；也可强制 minimal|low|medium|high|extra_high（extra_high 仅 4h/4n 系模型支持，其它模型自动就近夹到 high）
+    # EXTRA_HIGH 档下发给上游时的取值（"" = 用 model_capabilities.EXTRA_HIGH_WIRE_DEFAULT，
+    # 即 "extra_high"）。上游模型清单把同一档写作 "xhigh"，若真机 400 报未知枚举就改成 "xhigh"。
+    "extra_high_wire": "",
     # 生图
     "image_size": "4K",                   # 默认分辨率: 512|1K|2K|4K（按模型白名单校验）
     "image_aspect_ratio": "",             # 默认宽高比, ""=自动
@@ -95,7 +98,7 @@ DEFAULT_SETTINGS = {
     #   ["*"]  → 所有可用的文本 Gemini 模型
     #   []     → 不生成任何抗截断版本（等于把这个功能从模型列表里藏起来）
     "anti_truncation_models": ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen",
-                               "gemini-3.8-flash", "gemini-3.7-flash"],
+                               "gemini-4-neon", "gemini-3.8-flash", "gemini-3.7-flash"],
     # 预填充兼容模式: smart|minimal|off
     # 默认 smart。两种模式的优劣**取决于预填充的结尾形态**，用某真实酒馆预设
     # （预填充为一段完整句子 + 一个未闭合的思维链开标签）实测 gemini-3.6-flash × 3：
@@ -186,22 +189,40 @@ DEFAULT_SETTINGS = {
 # 设置（哪怕保存的是旧默认值本身），新模型就永远进不了模型列表——列表里看不到
 # gemini-4-carbon-抗截断 之类的新变体，还查不出原因。
 #
-# 这里只对**完全等于旧默认值**的持久化值做升级：用户自己改过的列表一律不动
+# 这里只对**完全等于某个历史默认值**的持久化值做升级：用户自己改过的列表一律不动
 # （包括故意清空成 [] 的情况）。
+#
+# 每新增一个模型就多一条 (历史默认值 → 当前默认值)，目标统一指向 DEFAULT_SETTINGS，
+# 免得改完默认值忘了改升级目标：
+#   2026-11-13：argon/3.8/3.7                     → +carbon +hydrogen
+#   2026-11-19：argon/carbon/hydrogen/3.8/3.7     → +neon
 _SETTINGS_UPGRADES = {
     "anti_truncation_models": [
         (["gemini-4-argon", "gemini-3.8-flash", "gemini-3.7-flash"],
          ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen",
+          "gemini-3.8-flash", "gemini-3.7-flash"]),
+        (["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen",
+          "gemini-3.8-flash", "gemini-3.7-flash"],
+         ["gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-4-neon",
           "gemini-3.8-flash", "gemini-3.7-flash"]),
     ],
 }
 
 
 def migrate_setting(key: str, value):
-    """把某个持久化设置值按升级表迁移到当前默认值；没有升级规则就原样返回。"""
-    for old, new in _SETTINGS_UPGRADES.get(key, []):
-        if isinstance(value, (list, tuple)) and list(value) == list(old):
-            return copy.deepcopy(new)
+    """把某个持久化设置值按升级表迁移到当前默认值；没有升级规则就原样返回。
+
+    规则**可链式**：连跳两版的老值（如 2026-11-13 之前那份默认列表）会连续升级
+    直到没有规则匹配，因此每加一个模型只需要补一条 "上一版 → 新版"。
+    """
+    rules = _SETTINGS_UPGRADES.get(key, [])
+    for _ in range(len(rules) + 1):
+        for old, new in rules:
+            if isinstance(value, (list, tuple)) and list(value) == list(old):
+                value = copy.deepcopy(new)
+                break
+        else:
+            break
     return value
 
 # 允许按模型单独保存（覆盖全局默认）的参数键。

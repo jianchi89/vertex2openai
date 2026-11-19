@@ -101,3 +101,25 @@
 - 自测：`py_compile` 全绿；另用独立脚本覆盖 45 项断言（档案档位、后缀解析、优先级、夹取、
   `/v1/models` 变体、抗截断候选、旧值升级），全部通过。
 
+## 第五轮：gemini-4-neon 适配（2026-11-19）
+
+上游模型清单新增 `gemini-4-neon`（与 `gemini-4-hydrogen` 同属"四档思考 / 64K 一元"那一类），
+同样没有抗截断变体。
+
+- `vertexModels.json` / `app/config.py` / `app/anti_truncation.py`：4n 加入模型列表与
+  `anti_truncation_models` 默认值 → `/v1/models` 出现 `gemini-4-neon-抗截断`。
+- `app/model_capabilities.py`：`EXTRA_HIGH_MODELS` 增加 `gemini-4-neon`，4n 因此也有
+  `extra_high` 档与 `gemini-4-neon-think-extra-high`（含与抗截断叠加）变体；`gemini-4-carbon`
+  与 `gemini-4-argon` 仍然没有这一档（会被就近夹成 `high`）。
+- `app/config.py`：`migrate_setting()` 改为**链式升级**，并补一条
+  "上一版默认（含 4c/4h）→ 本版（含 4n）"的规则。老用户 `web_state.json` 里存的
+  任一份历史默认值都会被连续升级到当前默认值，用户自定义列表仍然不动。
+- **EXTRA_HIGH 线格式取值可切换**（新增 `app/config.py` 的 `extra_high_wire`，默认 `""`）：
+  用户确认的取值是 `extra_high`，而上游清单把同一档写作 `xhigh`，两者都可能对（端点/时期不同）。
+  内部统一叫 `extra_high`，下发时由 `model_capabilities.wire_level()` 转换；真机若 400 报未知
+  枚举，`POST /api/settings {"extra_high_wire":"xhigh"}` 一条请求即可切换，无需改代码。
+  Express（`thinking_level`）与 Cookie（`thinkingLevel`，转大写）两条通道都走这个转换。
+- 自测：`py_compile` 全绿；自测脚本扩到 60 项断言（新增 4n 档案/变体、链式升级、
+  `wire_level` 两种取值与两条通道的线格式），全部通过。
+
+

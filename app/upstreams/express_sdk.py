@@ -125,7 +125,7 @@ def _build_thinking_config(base_model_name: str, request: OpenAIRequest, is_imag
             sdk_supports_level = False
 
         if sdk_supports_level:
-            thinking_config["thinking_level"] = t["level"]
+            thinking_config["thinking_level"] = mc.wire_level(t["level"], settings)
         else:
             print(f"⚠️ [推理配置] 当前 google-genai 版本 {genai_version_str} 不支持 thinking_level，已自动跳过该参数。")
 
