@@ -784,8 +784,7 @@ class NativeStreamRestorer:
         if fc.get("willContinue") is not True:
             if not self.string_closed:
                 self._close_string_leniently("functionCall 声明的参数结束")
-            if not self.full_args:
-                self.decoder.feed("}")
+            self._seal_object()
             self.call_closed = True
         return out
 
@@ -806,7 +805,18 @@ class NativeStreamRestorer:
              流依然会判失败。
 
         分片一个都没收到时不收口：那是真的异常，不能让空回复假装成功。
+
+        **必须幂等**（2026-11-21 真机踩到）：gemini-4-neon 在收尾时会额外发一片
+        ``{"jsonPath": "$.content", "stringValue": "", "willContinue": null}``——空内容
+        配 willContinue=null，于是 ``_call`` 已经按"分片级结束标记"把 content 字符串
+        闭合了（``string_closed=True``）；可外层 ``functionCall.willContinue`` 偏偏还是
+        ``true``，``call_closed`` 没置位，随后 ``finishReason=STOP`` 又走到这里。
+        老实现不检查 ``string_closed`` 就再喂一个 ``"``，第二根引号落在 JSON 的
+        commaOrEnd 状态上，状态机直接 ``_fail()``，结局是"正文已交付 6350 字，收口 1 次，
+        然后判 incomplete_arguments"——内容全对却报错。所以：字符串已闭合时什么都不做。
         """
+        if self.string_closed:
+            return                       # 已收口过（分片级 willContinue=null / 完整 args）：幂等返回
         if not (self.string_started and not self.full_args):
             raise _StreamFail("incomplete_args")
         self.decoder.feed('"')
@@ -841,11 +851,17 @@ class NativeStreamRestorer:
             # 正文早已逐片交付，只是上游没给收口标记（见 _close_string_leniently）：
             # 主动收口后交给下面的结构校验裁决，而不是直接判失败。
             self._close_string_leniently(f"finishReason={reason}")
-            if not self.full_args:
-                self.decoder.feed("}")
+            self._seal_object()
             self.call_closed = True
         if self.decoder.found and not self.decoder.valid and mapped not in CUT_SHORT_REASONS:
             self.failed = True
+            # 把 decoder 的内部状态打出来：下次再出现"正文全对却判失败"，一眼能看出是
+            # 结构没闭合（complete=False）还是被额外字符打坏了（invalid=True）。
+            _log(f"❌ 结构校验失败：decoder(complete={self.decoder.complete} "
+                 f"found={self.decoder.found} closed_content={self.decoder.closed_content} "
+                 f"invalid={self.decoder.invalid})，"
+                 f"str={self.string_started}/{self.string_closed} "
+                 f"call={self.call_closed} full_args={self.full_args}")
             raise _StreamFail("incomplete_arguments")
         if mapped == "tool_calls" and self.restored and not self.failed:
             # 唯一的工具调用就是合成通道，而且正文已经还原出来了：对客户端而言这是一次
@@ -855,6 +871,19 @@ class NativeStreamRestorer:
         self.terminal = True
         self.finish_reason = mapped
         return [self.writer.chunk({}, finish_reason=mapped, native_reason=reason)]
+
+    def _seal_object(self) -> None:
+        """把合成参数的外层 ``{...}`` 收口（幂等）。
+
+        为什么要单独拆出来并加判断：老实现在 ``_call`` 和 ``_finish`` 里都是无条件
+        ``feed("}")``。当 content 字符串已经由分片级标记闭合、外层对象也已经闭合
+        （decoder.complete=True）时，再喂一个 ``}`` 会命中 ContentDecoder 的
+        ``if self.complete: self._fail()``，把一次完整成功的回复打成 invalid。
+        decoder 已 invalid 时同样不该再喂（喂了也不起任何作用，只会让诊断信息更难读）。
+        """
+        if self.full_args or self.decoder.invalid or self.decoder.complete:
+            return
+        self.decoder.feed("}")
 
     def process(self, payload: Dict[str, Any]) -> List[str]:
         """处理一条原生 SSE data 负载，返回要立刻下发的 SSE 片段。"""
